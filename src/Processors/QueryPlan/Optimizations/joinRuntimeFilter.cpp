@@ -10,7 +10,6 @@
 #include <Functions/FunctionsLogical.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/FunctionFactory.h>
-#include <Functions/FunctionApplyFilter.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Core/ColumnWithTypeAndName.h>
@@ -97,14 +96,18 @@ static String runtimeFilterName(UInt64 structural_hash)
     return "_runtime_filter_" + std::to_string(structural_hash);
 }
 
-/// Add a const String column whose NAME and VALUE are both the STABLE structural id. It is only a
-/// label that carries the stable id into the DAG for EXPLAIN and the plan-step hash — nothing random
-/// is in the plan. The random RFL key travels out of band, inside the `__applyFilter` instance.
+/// Add the const String argument for `__applyFilter`. Its VALUE is the per-plan-build rendezvous
+/// `id.key` (what the build/probe sides agree on, and what can be serialized for distributed
+/// propagation), while its DAG result NAME is the STABLE structural `id.name` that drives EXPLAIN
+/// and the plan-step hash. It is marked `is_deterministic_constant=false`, so the cache-key paths
+/// (`updateHash(..., skip_volatile_constants)` and `serialize` under `skip_cache_key`) skip the
+/// volatile VALUE while still keying on the stable NAME — the rendezvous id never destabilises plan
+/// hashes, yet it is a plain const that serializes through the existing path.
 static const ActionsDAG::Node & addRuntimeFilterLabelColumn(ActionsDAG & actions_dag, const RuntimeFilterId & id)
 {
     auto string_type = std::make_shared<DataTypeString>();
-    auto label_column = string_type->createColumnConst(0, id.name);
-    return actions_dag.addColumn(std::move(label_column), std::move(string_type), id.name);
+    auto id_column = string_type->createColumnConst(0, id.key);
+    return actions_dag.addColumn(std::move(id_column), std::move(string_type), id.name, /*is_deterministic_constant=*/false);
 }
 
 static const ActionsDAG::Node & createRuntimeFilterCondition(
@@ -122,7 +125,7 @@ static const ActionsDAG::Node & createRuntimeFilterCondition(
     if (!key_column.type->equals(*filter_element_type))
         filter_argument = &actions_dag.addCast(key_column_node, filter_element_type, {}, nullptr);
 
-    auto filter_function = createApplyFilterOverloadResolver(id.key);
+    auto filter_function = FunctionFactory::instance().get("__applyFilter", /*context*/ nullptr);
     return actions_dag.addFunction(filter_function, {&filter_label_node, filter_argument}, {});
 }
 
@@ -378,7 +381,7 @@ bool tryAddJoinRuntimeFilter(QueryPlan::Node & node, QueryPlan::Nodes & nodes, c
             /// Build __applyFilter(label, tuple_node) condition directly,
             /// since the tuple node is freshly created and not yet in the DAG outputs
             const auto & filter_label_node = addRuntimeFilterLabelColumn(filter_dag, id);
-            auto filter_function = createApplyFilterOverloadResolver(id.key);
+            auto filter_function = FunctionFactory::instance().get("__applyFilter", /*context*/ nullptr);
             const auto & condition = filter_dag.addFunction(filter_function, {&filter_label_node, &tuple_node}, {});
 
             const auto * final_condition = addNullBypassForAntiJoin(filter_dag, &condition, join_keys_probe_side);

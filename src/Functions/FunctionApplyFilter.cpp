@@ -5,9 +5,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
-#include <Functions/FunctionApplyFilter.h>
 #include <Functions/IFunction.h>
-#include <Functions/IFunctionAdaptors.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/BloomFilter.h>
 #include <Processors/QueryPlan/RuntimeFilterLookup.h>
@@ -26,22 +24,22 @@ namespace ErrorCodes
 }
 
 /// Special function for JOIN runtime filtering
-/// Syntax: __applyFilter(label, key)
-/// - label: a String const whose NAME and VALUE are both the STABLE structural id
-///   (`_runtime_filter_<hash>`). It exists only to carry that id into the DAG for EXPLAIN and the
-///   plan-step hash; the function ignores its value at execution.
+/// Syntax: __applyFilter(filter_id, key)
+/// - filter_id: a String const whose VALUE is the per-plan-build rendezvous id under which the
+///   runtime filter is registered in the query-context `IRuntimeFilterLookup`; the build side
+///   registers under the same id. Its DAG result NAME is the STABLE structural id
+///   (`_runtime_filter_<hash>`), which is what travels into EXPLAIN and the plan-step hash. The const
+///   is marked `is_deterministic_constant=false`, so the cache-key paths skip its (volatile) VALUE
+///   while still keying on the stable NAME — the id can therefore be serialized for distributed
+///   propagation without destabilising plan hashes.
 /// - key: Value of any type that is checked to be present in the filter.
-/// The actual RFL rendezvous key is the RANDOM `random_key` carried as instance state (set at plan
-/// build, never materialized in the plan), so the random value never enters any hash. A
-/// default-constructed instance (empty key, e.g. a deserialized plan) is inert: all rows pass.
-/// Returns false if the key should be filtered
+/// An empty id (e.g. a placeholder/inert plan) makes the function pass all rows.
+/// Returns false if the key should be filtered.
 class FunctionApplyFilter final : public IFunction
 {
 public:
     static constexpr auto name = "__applyFilter";
     static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionApplyFilter>(); }
-
-    explicit FunctionApplyFilter(String random_key_ = {}) : random_key(std::move(random_key_)) {}
 
     String getName() const override { return name; }
 
@@ -71,7 +69,7 @@ public:
         if (!WhichDataType(arguments[0]).isString())
             throw Exception(
                     ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                    "First argument of function '{}' must be a String filter key",
+                    "First argument of function '{}' must be a String filter id",
                     getName());
 
         return std::make_shared<DataTypeUInt8>();
@@ -87,9 +85,15 @@ public:
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        /// `random_key` is the per-plan-build RFL rendezvous key, carried as instance state (not in
-        /// the DAG). An empty key means an inert (e.g. deserialized) instance: all rows pass.
-        if (random_key.empty())
+        /// The rendezvous id is the VALUE of the const first argument (set at plan build, the same id
+        /// the build side registers under). An empty id means an inert/placeholder filter: all rows pass.
+        String filter_id;
+        if (const auto * id_const = checkAndGetColumnConst<ColumnString>(arguments[0].column.get()))
+            filter_id = id_const->getValue<String>();
+        else if (const auto * id_column = checkAndGetColumn<ColumnString>(arguments[0].column.get()); id_column && id_column->size() >= 1)
+            filter_id = String(id_column->getDataAt(0));
+
+        if (filter_id.empty())
             return DataTypeUInt8().createColumnConst(input_rows_count, true);
 
         auto query_context = CurrentThread::tryGetQueryContext();
@@ -99,8 +103,8 @@ public:
         if (!filter_lookup)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Runtime filter lookup was not initialized");
 
-        /// Look up the filter by the random key; if it has not been registered/built yet, all rows pass.
-        auto filter = filter_lookup->find(random_key);
+        /// Look up the filter by the rendezvous id; if it has not been registered/built yet, all rows pass.
+        auto filter = filter_lookup->find(filter_id);
         if (!filter)
             return DataTypeUInt8().createColumnConst(input_rows_count, true);
 
@@ -108,17 +112,7 @@ public:
 
         return filter->find(data_column);
     }
-
-private:
-    /// Random per-plan-build RFL key; never appears in the plan/DAG/EXPLAIN, so it is never hashed.
-    const String random_key;
 };
-
-/// Build an `__applyFilter` overload resolver whose function instance carries `random_key` out of band.
-FunctionOverloadResolverPtr createApplyFilterOverloadResolver(String random_key)
-{
-    return std::make_shared<FunctionToOverloadResolverAdaptor>(std::make_shared<FunctionApplyFilter>(std::move(random_key)));
-}
 
 REGISTER_FUNCTION(FilterContains)
 {

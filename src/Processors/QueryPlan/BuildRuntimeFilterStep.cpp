@@ -105,6 +105,13 @@ BuildRuntimeFilterStep::BuildRuntimeFilterStep(
 
 void BuildRuntimeFilterStep::transformPipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
+    /// A step with no rendezvous key (e.g. a deserialized/placeholder plan — the random key is never
+    /// serialized) can never register a filter that any `__applyFilter` looks up. Skip the build
+    /// transform entirely so the step is a true passthrough: no key casting/insertion, no wasted
+    /// build work for a filter that would never be applied.
+    if (filter_key.empty())
+        return;
+
     auto streams = pipeline.getNumStreams();
     auto query_context = CurrentThread::get().tryGetQueryContext();
     pipeline.addSimpleTransform([&, query_context](const SharedHeader & header, QueryPipelineBuilder::StreamType stream_type)-> ProcessorPtr
