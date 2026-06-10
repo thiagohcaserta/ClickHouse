@@ -1,4 +1,3 @@
-fingerprint collides	1
-separate subtree rows	600	600
-shared probe rows	400
-rf on == off	1
+same fingerprint	1
+rf on	(600,13679823608276939864)	(600,5671678938554744508)
+rf off	(600,13679823608276939864)	(600,5671678938554744508)
