@@ -85,12 +85,11 @@ static const ActionsDAG::Node & addTupleOfKeys(
 /// used as the `__applyFilter` argument's DAG result NAME, the EXPLAIN label, and the plan-step hash
 /// input — it is identical across the two Auto-PR plan builds. `key` is a fresh RANDOM string used
 /// only as the `IRuntimeFilterLookup` lookup key (the build/probe rendezvous), so every plan build —
-/// including recursive-CTE iterations and MV blocks — gets its own RFL slot, exactly like master.
+/// including recursive-CTE iterations and MV blocks — gets its own RFL slot.
 struct RuntimeFilterId
 {
     String name;
     String key;
-    UInt64 structural_hash;
 };
 
 static String runtimeFilterName(UInt64 structural_hash)
@@ -134,6 +133,39 @@ static bool supportsRuntimeFilter(JoinAlgorithm join_algorithm)
         join_algorithm == JoinAlgorithm::HASH ||
         join_algorithm == JoinAlgorithm::PARALLEL_HASH ||
         join_algorithm == JoinAlgorithm::GRACE_HASH;
+}
+
+/// Deterministic structural fingerprint of this join's runtime filters. Unlike a random name, it is
+/// identical across the two Auto-PR plan builds (single-replica and parallel-replicas), so their
+/// plans hash equally with no special-casing.
+static UInt64 calculateJoinFingerprint(
+    const JoinStepLogical & join_step,
+    bool check_left_does_not_contain,
+    size_t total_join_on_predicates_count,
+    const ColumnsWithTypeAndName & join_keys_probe_side,
+    const ColumnsWithTypeAndName & join_keys_build_side)
+{
+    const auto & join_operator = join_step.getJoinOperator();
+
+    SipHash fingerprint_hash;
+    fingerprint_hash.update(join_step.getSerializationName());
+    fingerprint_hash.update(static_cast<uint8_t>(join_operator.kind));
+    fingerprint_hash.update(static_cast<uint8_t>(join_operator.strictness));
+    fingerprint_hash.update(static_cast<uint8_t>(join_operator.locality));
+    fingerprint_hash.update(check_left_does_not_contain);
+    fingerprint_hash.update(total_join_on_predicates_count);
+    auto hash_update_keys = [&](const ColumnsWithTypeAndName & keys)
+    {
+        fingerprint_hash.update(keys.size());
+        for (const auto & key : keys)
+        {
+            fingerprint_hash.update(key.name);
+            fingerprint_hash.update(key.type->getName());
+        }
+    };
+    hash_update_keys(join_keys_probe_side);
+    hash_update_keys(join_keys_build_side);
+    return fingerprint_hash.get64();
 }
 
 bool tryAddJoinRuntimeFilter(QueryPlan::Node & node, QueryPlan::Nodes & nodes, const QueryPlanOptimizationSettings & optimization_settings)
@@ -242,33 +274,9 @@ bool tryAddJoinRuntimeFilter(QueryPlan::Node & node, QueryPlan::Nodes & nodes, c
             total_join_on_predicates_count, join_keys_probe_side.size(), join_keys_build_side.size());
     }
 
-    /// Deterministic structural fingerprint of this join's runtime filters. Unlike a random name,
-    /// it is identical across the two Auto-PR plan builds (single-replica and parallel-replicas), so
-    /// their plans hash equally with no special-casing.
-    SipHash fingerprint_hash;
-    fingerprint_hash.update(join_step->getSerializationName());
-    fingerprint_hash.update(static_cast<uint8_t>(join_operator.kind));
-    fingerprint_hash.update(static_cast<uint8_t>(join_operator.strictness));
-    fingerprint_hash.update(static_cast<uint8_t>(join_operator.locality));
-    fingerprint_hash.update(check_left_does_not_contain);
-    fingerprint_hash.update(total_join_on_predicates_count);
-    auto hash_update_keys = [&](const ColumnsWithTypeAndName & keys)
-    {
-        fingerprint_hash.update(keys.size());
-        for (const auto & key : keys)
-        {
-            fingerprint_hash.update(key.name);
-            fingerprint_hash.update(key.type->getName());
-        }
-    };
-    hash_update_keys(join_keys_probe_side);
-    hash_update_keys(join_keys_build_side);
-    const UInt64 base_fingerprint = fingerprint_hash.get64();
+    const UInt64 base_fingerprint = calculateJoinFingerprint(
+        *join_step, check_left_does_not_contain, total_join_on_predicates_count, join_keys_probe_side, join_keys_build_side);
 
-    /// One id per filter (per key in the standard path, or one for the tuple path). The index
-    /// disambiguates filters of the same join within a single plan. The structural hash is stable;
-    /// the lookup key is a fresh random string so each plan build (and re-execution) gets its own
-    /// RFL slot.
     auto make_id = [&](size_t i) -> RuntimeFilterId
     {
         SipHash h;
@@ -276,7 +284,7 @@ bool tryAddJoinRuntimeFilter(QueryPlan::Node & node, QueryPlan::Nodes & nodes, c
         h.update(i);
         const UInt64 structural_hash = h.get64();
         const String random_key = fmt::format("_rf_rnd_{:016x}_{:016x}", thread_local_rng(), thread_local_rng());
-        return RuntimeFilterId{.name = runtimeFilterName(structural_hash), .key = random_key, .structural_hash = structural_hash};
+        return RuntimeFilterId{.name = runtimeFilterName(structural_hash), .key = random_key};
     };
 
     /// Compute common types for each key pair
