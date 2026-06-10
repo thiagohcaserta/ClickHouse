@@ -97,12 +97,19 @@ static String runtimeFilterName(UInt64 structural_hash)
 }
 
 /// Add the const String argument for `__applyFilter`. Its VALUE is the per-plan-build rendezvous
-/// `id.key` (what the build/probe sides agree on, and what can be serialized for distributed
-/// propagation), while its DAG result NAME is the STABLE structural `id.name` that drives EXPLAIN
-/// and the plan-step hash. It is marked `is_deterministic_constant=false`, so the cache-key paths
-/// (`updateHash(..., skip_volatile_constants)` and `serialize` under `skip_cache_key`) skip the
-/// volatile VALUE while still keying on the stable NAME — the rendezvous id never destabilises plan
-/// hashes, yet it is a plain const that serializes through the existing path.
+/// `id.key` (what the build and probe sides agree on, and what `__applyFilter` reads at execution);
+/// its DAG result NAME is the STABLE structural `id.name` — the filter's stable identity and what
+/// EXPLAIN renders (the pretty printer keys on the name via `getRuntimeFilterId`, never on the value).
+///
+/// The value is a fresh random key per plan build, so the const is genuinely non-deterministic and is
+/// marked `is_deterministic_constant=false`. Two existing mechanisms keep that volatile value from
+/// leaking into cached/keyed state:
+///   - Query condition cache: `Node::isDeterministic` reports the filter expression as
+///     non-deterministic (the `__applyFilter` function is non-deterministic, and so is this constant),
+///     so the QCC skips it instead of reusing a per-granule result that a later execution with a
+///     different key would read as stale.
+///   - Hash-table-statistics cache key: it is computed during join-order optimization, before
+///     `tryAddJoinRuntimeFilter` adds the filter, so the volatile value is not in the hashed DAG.
 static const ActionsDAG::Node & addRuntimeFilterLabelColumn(ActionsDAG & actions_dag, const RuntimeFilterId & id)
 {
     auto string_type = std::make_shared<DataTypeString>();
