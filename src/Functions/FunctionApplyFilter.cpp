@@ -90,7 +90,7 @@ public:
         String filter_id;
         if (const auto * id_const = checkAndGetColumnConst<ColumnString>(arguments[0].column.get()))
             filter_id = id_const->getValue<String>();
-        else if (const auto * id_column = checkAndGetColumn<ColumnString>(arguments[0].column.get()); id_column && id_column->size() >= 1)
+        else if (const auto * id_column = checkAndGetColumn<ColumnString>(arguments[0].column.get()); id_column && !id_column->empty())
             filter_id = String(id_column->getDataAt(0));
 
         if (filter_id.empty())
